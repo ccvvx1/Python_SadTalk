@@ -3,13 +3,14 @@ import torch.nn.functional as F
 from torch import nn
 from src.audio2pose_models.res_unet import ResUnet
 
+# 辅助函数，将类别索引转换为独热编码
 def class2onehot(idx, class_num):
-
     assert torch.max(idx).item() < class_num
     onehot = torch.zeros(idx.size(0), class_num).to(idx.device)
     onehot.scatter_(1, idx, 1)
     return onehot
 
+# 定义条件变分自编码器（CVAE）模型
 class CVAE(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -23,15 +24,19 @@ class CVAE(nn.Module):
 
         self.latent_size = latent_size
 
+        # 创建编码器和解码器
         self.encoder = ENCODER(encoder_layer_sizes, latent_size, num_classes,
                                 audio_emb_in_size, audio_emb_out_size, seq_len)
         self.decoder = DECODER(decoder_layer_sizes, latent_size, num_classes,
                                 audio_emb_in_size, audio_emb_out_size, seq_len)
+
+    # 重参数化技巧
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    # 前向传播：编码器->重参数化->解码器
     def forward(self, batch):
         batch = self.encoder(batch)
         mu = batch['mu']
@@ -40,14 +45,11 @@ class CVAE(nn.Module):
         batch['z'] = z
         return self.decoder(batch)
 
+    # 测试模式下的前向传播
     def test(self, batch):
-        '''
-        class_id = batch['class']
-        z = torch.randn([class_id.size(0), self.latent_size]).to(class_id.device)
-        batch['z'] = z
-        '''
         return self.decoder(batch)
 
+# 定义编码器（ENCODER）模型
 class ENCODER(nn.Module):
     def __init__(self, layer_sizes, latent_size, num_classes, 
                 audio_emb_in_size, audio_emb_out_size, seq_len):
@@ -58,6 +60,7 @@ class ENCODER(nn.Module):
         self.seq_len = seq_len
 
         self.MLP = nn.Sequential()
+        # 编码器的MLP网络
         layer_sizes[0] += latent_size + seq_len*audio_emb_out_size + 6
         for i, (in_size, out_size) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
             self.MLP.add_module(
@@ -70,32 +73,33 @@ class ENCODER(nn.Module):
 
         self.classbias = nn.Parameter(torch.randn(self.num_classes, latent_size))
 
+    # 编码器的前向传播
     def forward(self, batch):
         class_id = batch['class']
-        pose_motion_gt = batch['pose_motion_gt']                             #bs seq_len 6
-        ref = batch['ref']                             #bs 6
+        pose_motion_gt = batch['pose_motion_gt']  # bs seq_len 6
+        ref = batch['ref']  # bs 6
         bs = pose_motion_gt.shape[0]
-        audio_in = batch['audio_emb']                          # bs seq_len audio_emb_in_size
+        audio_in = batch['audio_emb']  # bs seq_len audio_emb_in_size
 
-        #pose encode
-        pose_emb = self.resunet(pose_motion_gt.unsqueeze(1))          #bs 1 seq_len 6 
-        pose_emb = pose_emb.reshape(bs, -1)                    #bs seq_len*6
+        # 姿势编码
+        pose_emb = self.resunet(pose_motion_gt.unsqueeze(1))  # bs 1 seq_len 6 
+        pose_emb = pose_emb.reshape(bs, -1)  # bs seq_len*6
 
-        #audio mapping
-        print(audio_in.shape)
-        audio_out = self.linear_audio(audio_in)                # bs seq_len audio_emb_out_size
+        # 音频映射
+        audio_out = self.linear_audio(audio_in)  # bs seq_len audio_emb_out_size
         audio_out = audio_out.reshape(bs, -1)
 
-        class_bias = self.classbias[class_id]                  #bs latent_size
-        x_in = torch.cat([ref, pose_emb, audio_out, class_bias], dim=-1) #bs seq_len*(audio_emb_out_size+6)+latent_size
+        class_bias = self.classbias[class_id]  # bs latent_size
+        x_in = torch.cat([ref, pose_emb, audio_out, class_bias], dim=-1)  # bs seq_len*(audio_emb_out_size+6)+latent_size
         x_out = self.MLP(x_in)
 
         mu = self.linear_means(x_out)
-        logvar = self.linear_means(x_out)                      #bs latent_size 
+        logvar = self.linear_means(x_out)  # bs latent_size 
 
-        batch.update({'mu':mu, 'logvar':logvar})
+        batch.update({'mu': mu, 'logvar': logvar})
         return batch
 
+# 定义解码器（DECODER）模型
 class DECODER(nn.Module):
     def __init__(self, layer_sizes, latent_size, num_classes, 
                 audio_emb_in_size, audio_emb_out_size, seq_len):
@@ -120,30 +124,27 @@ class DECODER(nn.Module):
 
         self.classbias = nn.Parameter(torch.randn(self.num_classes, latent_size))
 
+    # 解码器的前向传播
     def forward(self, batch):
 
-        z = batch['z']                                          #bs latent_size
+        z = batch['z']  # bs latent_size
         bs = z.shape[0]
         class_id = batch['class']
-        ref = batch['ref']                             #bs 6
-        audio_in = batch['audio_emb']                           # bs seq_len audio_emb_in_size
-        #print('audio_in: ', audio_in[:, :, :10])
+        ref = batch['ref']  # bs 6
+        audio_in = batch['audio_emb']  # bs seq_len audio_emb_in_size
 
-        audio_out = self.linear_audio(audio_in)                 # bs seq_len audio_emb_out_size
-        #print('audio_out: ', audio_out[:, :, :10])
-        audio_out = audio_out.reshape([bs, -1])                 # bs seq_len*audio_emb_out_size
-        class_bias = self.classbias[class_id]                   #bs latent_size
+        audio_out = self.linear_audio(audio_in)  # bs seq_len audio_emb_out_size
+        audio_out = audio_out.reshape([bs, -1])  # bs seq_len*audio_emb_out_size
+        class_bias = self.classbias[class_id]  # bs latent_size
 
         z = z + class_bias
         x_in = torch.cat([ref, z, audio_out], dim=-1)
-        x_out = self.MLP(x_in)                                  # bs layer_sizes[-1]
+        x_out = self.MLP(x_in)  # bs layer_sizes[-1]
         x_out = x_out.reshape((bs, self.seq_len, -1))
 
-        #print('x_out: ', x_out)
+        pose_emb = self.resunet(x_out.unsqueeze(1))  # bs 1 seq_len 6
 
-        pose_emb = self.resunet(x_out.unsqueeze(1))             #bs 1 seq_len 6
+        pose_motion_pred = self.pose_linear(pose_emb.squeeze(1))  # bs seq_len 6
 
-        pose_motion_pred = self.pose_linear(pose_emb.squeeze(1))       #bs seq_len 6
-
-        batch.update({'pose_motion_pred':pose_motion_pred})
+        batch.update({'pose_motion_pred': pose_motion_pred})
         return batch
